@@ -51,6 +51,9 @@ COLUMN_ALIASES: Dict[str, Iterable[str]] = {
         "response points unchecked",
         "points unchecked",
     ),
+    "version": ("version",),
+    "duration": ("durée", "duree", "duration", "temps"),
+    "status": ("état", "etat", "state", "status", "statut"),
 }
 
 

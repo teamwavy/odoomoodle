@@ -1,11 +1,12 @@
-"""Logique de conversion des fichiers Excel Odoo vers Moodle XML."""
+﻿"""Logique de conversion des fichiers Excel Odoo vers Moodle XML."""
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from io import BytesIO
 import re
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional
 
 import pandas as pd
 from lxml import etree
@@ -16,6 +17,14 @@ from .utils import create_cdata, is_blank, norm_points, norm_yn, normalize_heade
 DEFAULT_OPTIONS = {
     "multichoice_mode": "auto",  # auto | all_or_nothing | partial
     "shuffleanswers": True,
+}
+
+logger = logging.getLogger(__name__)
+
+OPTIONAL_COLUMNS = {
+    "version": "Version",
+    "duration": "Durée",
+    "status": "État",
 }
 
 
@@ -115,6 +124,14 @@ def extract_questions(df: pd.DataFrame, options: Dict) -> List[ParsedQuestion]:
         readable = ", ".join(sorted(missing))
         raise ConversionError(f"Colonnes manquantes dans le fichier : {readable}")
 
+    missing_optional = []
+    for key, label in OPTIONAL_COLUMNS.items():
+        if key not in df.columns:
+            df[key] = None
+            missing_optional.append(label)
+    for label in missing_optional:
+        logger.warning("Colonne manquante : %s — ignorée", label)
+
     for col in ("name", "points", "answer", "solution", "acceptable"):
         if col not in df.columns:
             df[col] = None
@@ -151,10 +168,20 @@ def extract_questions(df: pd.DataFrame, options: Dict) -> List[ParsedQuestion]:
             reference = f"{reference}-{len(questions) + 1}"
         seen_keys.add(key)
 
-        answers = _extract_answers(group)
+        cleaned_type = _clean_type_label(raw_type)
+        answers = _extract_answers(group, cleaned_type)
         if not answers:
-            # On ignore les entrées sans réponses réelles (lignes d'entête ou métadonnées).
-            continue
+            tf_value = None
+            if cleaned_type in {"ouinon", "truefalse", "vraifaux"}:
+                tf_value = _guess_truefalse_answer([], base)
+            if tf_value is not None:
+                answers = [
+                    Answer(text="true", is_correct=tf_value is True),
+                    Answer(text="false", is_correct=tf_value is False),
+                ]
+            else:
+                # On ignore les entrées sans réponses réelles (lignes d'entête ou métadonnées).
+                continue
         has_points_column = False
         if "answer_points_checked" in group.columns:
             cleaned_points = (
@@ -180,11 +207,40 @@ def extract_questions(df: pd.DataFrame, options: Dict) -> List[ParsedQuestion]:
     return questions
 
 
-def _extract_answers(group: pd.DataFrame) -> List[Answer]:
+def _extract_answers(group: pd.DataFrame, cleaned_type: str) -> List[Answer]:
     """Retourne la liste des réponses d'un groupe."""
-    textual_solutions: set[str] = set()
+    only_acceptable = cleaned_type in {"qcu", "choixunique", "singlechoice"}
+    preferred_markers = ("acceptable",) if only_acceptable else ("solution", "acceptable")
 
-    for marker in ("solution", "acceptable"):
+    question_points_value: Optional[float] = None
+    if only_acceptable:
+        raw_points = group.iloc[0].get("points") if "points" in group.columns else None
+        if raw_points is not None and str(raw_points).strip() != "":
+            try:
+                question_points_value = float(str(raw_points).replace(",", "."))
+            except (ValueError, TypeError):
+                question_points_value = None
+
+    def _has_values(marker: str) -> bool:
+        if marker not in group.columns:
+            return False
+        values = (
+            group[marker]
+            .dropna()
+            .astype(str)
+            .str.strip()
+        )
+        return values.ne("").any()
+
+    if any(_has_values(marker) for marker in preferred_markers):
+        text_markers = preferred_markers
+    else:
+        text_markers = ("solution", "acceptable")
+
+    bool_markers = text_markers
+
+    textual_solutions: set[str] = set()
+    for marker in text_markers:
         if marker not in group.columns:
             continue
         for value in group[marker].dropna().astype(str):
@@ -194,25 +250,32 @@ def _extract_answers(group: pd.DataFrame) -> List[Answer]:
             for part in parts:
                 cleaned = part.strip()
                 if cleaned:
-                    textual_solutions.add(cleaned)
+                    textual_solutions.add(cleaned.lower())
 
     answers: List[Answer] = []
     for _, row in group.iterrows():
         text = row.get("answer")
         if is_blank(text):
             continue
+        candidate = str(text).strip()
+        candidate_norm = candidate.lower()
         is_correct = False
-        for marker in ("solution", "acceptable"):
+
+        for marker in bool_markers:
             flag = norm_yn(row.get(marker))
             if flag is True:
                 is_correct = True
                 break
+
         if not is_correct and textual_solutions:
-            candidate = str(text).strip()
-            if candidate in textual_solutions:
+            # Comparaison insensible à la casse pour les réponses textuelles.
+            if candidate_norm in textual_solutions:
                 is_correct = True
-        answer = Answer(text=str(text).strip(), is_correct=is_correct)
-        if "answer_points_checked" in group.columns:
+
+        answer = Answer(text=candidate, is_correct=is_correct)
+        if only_acceptable and question_points_value is not None:
+            answer.points_value = question_points_value if is_correct else 0.0
+        elif "answer_points_checked" in group.columns and not only_acceptable:
             try:
                 raw = row.get("answer_points_checked")
                 if raw is not None and str(raw).strip() != "":
@@ -349,7 +412,7 @@ def _guess_truefalse_answer(answers: List[Answer], base_row: pd.Series) -> Optio
         tf_value = norm_yn(ans.text)
         if ans.is_correct and tf_value is not None:
             return tf_value
-    for field in ("solution", "answer"):
+    for field in ("solution", "answer", "acceptable"):
         value = base_row.get(field)
         tf_value = norm_yn(value)
         if tf_value is not None:
@@ -441,4 +504,5 @@ def add_essay_settings(q_element: etree.Element) -> None:
     response_el = etree.SubElement(q_element, "responsetemplate", format="html")
     response_text = etree.SubElement(response_el, "text")
     response_text.text = create_cdata("")
+
 
