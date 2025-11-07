@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from decimal import Decimal, InvalidOperation
+import unicodedata
 from typing import Dict, Iterable, Optional
 
 from lxml import etree
@@ -51,6 +52,12 @@ COLUMN_ALIASES: Dict[str, Iterable[str]] = {
         "response points unchecked",
         "points unchecked",
     ),
+    "points_from": (
+        "compter les points depuis",
+        "points depuis",
+        "count points from",
+        "count from",
+    ),
     "version": ("version",),
     "duration": ("durée", "duree", "duration", "temps"),
     "status": ("état", "etat", "state", "status", "statut"),
@@ -79,7 +86,7 @@ def norm_yn(value: object) -> Optional[bool]:
     """Normalise les valeurs Oui/Non en booléen."""
     if value is None:
         return None
-    text = str(value).strip().lower()
+    text = normalize_choice_text(value).lower()
     if text in {"oui", "yes", "vrai", "true", "1", "y"}:
         return True
     if text in {"non", "no", "faux", "false", "0", "n"}:
@@ -131,3 +138,15 @@ def is_blank(value: object) -> bool:
     if isinstance(value, str) and value.strip() == "":
         return True
     return False
+def normalize_choice_text(value: object) -> str:
+    """Nettoie une valeur textuelle pour comparaison (supprime espaces invisibles)."""
+    if value is None:
+        return ""
+    text = unicodedata.normalize("NFKC", str(value))
+    for pattern, replacement in (
+        ("\u00A0", " "),
+        ("\u200B", ""),
+        ("\ufeff", ""),
+    ):
+        text = text.replace(pattern, replacement)
+    return text.strip()

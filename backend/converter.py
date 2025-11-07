@@ -6,12 +6,20 @@ import logging
 from dataclasses import dataclass
 from io import BytesIO
 import re
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 from lxml import etree
 
-from .utils import create_cdata, is_blank, norm_points, norm_yn, normalize_header, slugify_filename
+from .utils import (
+    create_cdata,
+    is_blank,
+    norm_points,
+    norm_yn,
+    normalize_choice_text,
+    normalize_header,
+    slugify_filename,
+)
 
 
 DEFAULT_OPTIONS = {
@@ -169,7 +177,7 @@ def extract_questions(df: pd.DataFrame, options: Dict) -> List[ParsedQuestion]:
         seen_keys.add(key)
 
         cleaned_type = _clean_type_label(raw_type)
-        answers = _extract_answers(group, cleaned_type)
+        answers, meta = _extract_answers(group, cleaned_type)
         if not answers:
             tf_value = None
             if cleaned_type in {"ouinon", "truefalse", "vraifaux"}:
@@ -199,6 +207,7 @@ def extract_questions(df: pd.DataFrame, options: Dict) -> List[ParsedQuestion]:
             raw_type,
             answers,
             base,
+            meta,
             has_points_column,
             options,
         )
@@ -207,10 +216,20 @@ def extract_questions(df: pd.DataFrame, options: Dict) -> List[ParsedQuestion]:
     return questions
 
 
-def _extract_answers(group: pd.DataFrame, cleaned_type: str) -> List[Answer]:
-    """Retourne la liste des réponses d'un groupe."""
+def _extract_answers(group: pd.DataFrame, cleaned_type: str) -> Tuple[List[Answer], Dict[str, object]]:
+    """Retourne la liste des réponses d'un groupe et des métadonnées."""
     only_acceptable = cleaned_type in {"qcu", "choixunique", "singlechoice"}
     preferred_markers = ("acceptable",) if only_acceptable else ("solution", "acceptable")
+
+    points_from_mode = normalize_choice_text(
+        group.iloc[0].get("points_from") if "points_from" in group.columns else ""
+    ).lower()
+    if points_from_mode.startswith("question"):
+        evaluation_mode = "question"
+    elif points_from_mode.startswith("reponse") or points_from_mode.startswith("réponse"):
+        evaluation_mode = "responses"
+    else:
+        evaluation_mode = "default"
 
     question_points_value: Optional[float] = None
     if only_acceptable:
@@ -221,71 +240,141 @@ def _extract_answers(group: pd.DataFrame, cleaned_type: str) -> List[Answer]:
             except (ValueError, TypeError):
                 question_points_value = None
 
+    def _to_float(raw: object) -> Optional[float]:
+        if raw is None:
+            return None
+        text = str(raw).strip().replace(",", ".")
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            return None
+
     def _has_values(marker: str) -> bool:
         if marker not in group.columns:
             return False
-        values = (
-            group[marker]
-            .dropna()
-            .astype(str)
-            .str.strip()
-        )
-        return values.ne("").any()
+        series = group[marker].dropna()
+        if series.empty:
+            return False
+        normalized = series.apply(normalize_choice_text)
+        return normalized.ne("").any()
 
-    if any(_has_values(marker) for marker in preferred_markers):
-        text_markers = preferred_markers
+    def _column_all_zero(column: str) -> bool:
+        if column not in group.columns:
+            return True
+        values = group[column].apply(_to_float).fillna(0.0)
+        return not values.abs().gt(0).any()
+
+    all_points_zero = all(_column_all_zero(col) for col in ("answer_points_checked", "answer_points_unchecked"))
+
+    if evaluation_mode == "responses":
+        text_markers: Tuple[str, ...] = ()
+        bool_markers: Tuple[str, ...] = ()
     else:
-        text_markers = ("solution", "acceptable")
-
-    bool_markers = text_markers
+        if any(_has_values(marker) for marker in preferred_markers):
+            text_markers = preferred_markers
+        else:
+            text_markers = ("solution", "acceptable")
+        bool_markers = text_markers
 
     textual_solutions: set[str] = set()
     for marker in text_markers:
         if marker not in group.columns:
             continue
-        for value in group[marker].dropna().astype(str):
-            if norm_yn(value) is not None:
+        for value in group[marker].dropna():
+            normalized_value = normalize_choice_text(value)
+            if not normalized_value:
                 continue
-            parts = re.split(r"[;\n\r,/]+", value)
+            if norm_yn(normalized_value) is not None:
+                continue
+            parts = re.split(r"[;\n\r,/]+", normalized_value)
             for part in parts:
-                cleaned = part.strip()
+                cleaned = normalize_choice_text(part)
                 if cleaned:
-                    textual_solutions.add(cleaned.lower())
+                    textual_solutions.add(" ".join(cleaned.lower().split()))
 
-    answers: List[Answer] = []
+    answers_map: Dict[str, Answer] = {}
     for _, row in group.iterrows():
         text = row.get("answer")
         if is_blank(text):
             continue
-        candidate = str(text).strip()
-        candidate_norm = candidate.lower()
+        display_text = normalize_choice_text(text)
+        if not display_text:
+            continue
+        candidate_norm = " ".join(display_text.lower().split())
         is_correct = False
+        points_value: Optional[float] = None
 
-        for marker in bool_markers:
-            flag = norm_yn(row.get(marker))
-            if flag is True:
-                is_correct = True
-                break
+        if evaluation_mode == "responses":
+            checked = _to_float(row.get("answer_points_checked"))
+            unchecked = _to_float(row.get("answer_points_unchecked"))
+            if checked is not None:
+                points_value = checked
+                is_correct = checked > 0 and (unchecked is None or unchecked <= 0)
+            else:
+                for marker in bool_markers:
+                    flag = norm_yn(row.get(marker))
+                    if flag is True:
+                        is_correct = True
+                        break
+        else:
+            for marker in bool_markers:
+                flag = norm_yn(row.get(marker))
+                if flag is True:
+                    is_correct = True
+                    break
 
-        if not is_correct and textual_solutions:
-            # Comparaison insensible à la casse pour les réponses textuelles.
-            if candidate_norm in textual_solutions:
-                is_correct = True
+            if not is_correct and textual_solutions:
+                # Comparaison insensible à la casse pour les réponses textuelles.
+                if candidate_norm in textual_solutions:
+                    is_correct = True
 
-        answer = Answer(text=candidate, is_correct=is_correct)
-        if only_acceptable and question_points_value is not None:
-            answer.points_value = question_points_value if is_correct else 0.0
-        elif "answer_points_checked" in group.columns and not only_acceptable:
-            try:
-                raw = row.get("answer_points_checked")
-                if raw is not None and str(raw).strip() != "":
-                    value = float(str(raw).replace(",", "."))
-                    answer.is_correct = value > 0
-                    answer.points_value = value
-            except Exception:  # pragma: no cover - conversion defensive
-                pass
-        answers.append(answer)
-    return answers
+            if not is_correct and evaluation_mode == "default" and not only_acceptable:
+                checked = _to_float(row.get("answer_points_checked"))
+                if checked is not None:
+                    points_value = checked
+                    is_correct = checked > 0
+
+        if points_value is None and only_acceptable and question_points_value is not None:
+            points_value = question_points_value if is_correct else 0.0
+
+        existing = answers_map.get(candidate_norm)
+        if existing:
+            if points_value is not None:
+                if existing.points_value is None or points_value > existing.points_value:
+                    existing.points_value = points_value
+                if not only_acceptable and points_value > 0:
+                    existing.is_correct = True
+            existing.is_correct = existing.is_correct or is_correct
+            if only_acceptable and question_points_value is not None:
+                existing.points_value = question_points_value if existing.is_correct else 0.0
+            continue
+
+        answer = Answer(text=display_text, is_correct=is_correct)
+        if points_value is not None:
+            answer.points_value = points_value
+        answers_map[candidate_norm] = answer
+
+    # Ajustement final pour QCU : appliquer les points question si nécessaire.
+    if only_acceptable and question_points_value is not None:
+        for answer in answers_map.values():
+            answer.points_value = question_points_value if answer.is_correct else 0.0
+
+    if cleaned_type in {"qcu", "choixunique", "singlechoice"}:
+        is_single: Optional[bool] = True
+    elif cleaned_type in {"qcm", "choixmultiple", "multiplechoice", "multichoice"}:
+        is_single = False
+    else:
+        is_single = None
+
+    metadata = {
+        "evaluation_mode": evaluation_mode,
+        "all_points_zero": all_points_zero,
+        "is_single": is_single,
+    }
+
+    return list(answers_map.values()), metadata
 
 
 def _clean_type_label(label: str) -> str:
@@ -300,6 +389,7 @@ def _build_question(
     raw_type: str,
     answers: List[Answer],
     base_row: pd.Series,
+    meta: Dict[str, object],
     has_points_column: bool,
     options: Dict,
 ) -> ParsedQuestion:
@@ -307,19 +397,42 @@ def _build_question(
     errors: List[str] = []
 
     cleaned_type = _clean_type_label(raw_type)
-    moodle_type = determine_moodle_type(cleaned_type, answers, options, has_points_column)
+    evaluation_mode = str(meta.get("evaluation_mode") or "default")
+    all_points_zero = bool(meta.get("all_points_zero"))
+    moodle_type = determine_moodle_type(
+        cleaned_type,
+        answers,
+        options,
+        has_points_column,
+        evaluation_mode,
+        all_points_zero,
+    )
 
     defaultgrade = norm_points(base_row.get("points"))
     shuffle = bool(options.get("shuffleanswers", True))
-    single = moodle_type == "multichoice"  # multichoice Moodle (QCU) => single
+    single_flag = meta.get("is_single")
+    if single_flag is None:
+        single = moodle_type == "multichoice"
+    else:
+        single = bool(single_flag)
 
-    if moodle_type in {"multichoice", "multichoiceset", "oumultiresponse"}:
+    if moodle_type == "multichoice":
+        unique_correct = {
+            " ".join(normalize_choice_text(ans.text).lower().split())
+            for ans in answers
+            if ans.is_correct
+        }
+        if single:
+            if not unique_correct:
+                errors.append("Aucune bonne réponse identifiée.")
+            elif len(unique_correct) > 1:
+                errors.append("La question à choix unique possède plusieurs bonnes réponses.")
+        else:
+            if not unique_correct:
+                errors.append("Aucune bonne réponse identifiée.")
+    elif moodle_type in {"multichoiceset", "oumultiresponse"}:
         correct_count = sum(1 for ans in answers if ans.is_correct)
-        if correct_count == 0:
-            errors.append("Aucune bonne réponse identifiée.")
-        elif moodle_type == "multichoice" and correct_count != 1:
-            errors.append("La question à choix unique possède plusieurs bonnes réponses.")
-        elif moodle_type != "multichoice" and correct_count < 1:
+        if correct_count < 1:
             errors.append("La question à choix multiple nécessite au moins une bonne réponse.")
 
     if moodle_type == "truefalse":
@@ -354,6 +467,8 @@ def determine_moodle_type(
     answers: List[Answer],
     options: Dict,
     has_points_column: bool = False,
+    evaluation_mode: str = "default",
+    all_points_zero: bool = False,
 ) -> str:
     """Sélectionne le type Moodle en fonction du type détecté et des options."""
     if cleaned_type in {"ouinon", "truefalse", "vraifaux"}:
@@ -368,7 +483,12 @@ def determine_moodle_type(
         "toutourien",
         "allonothing",
     }:
-        return determine_multichoice_variant(cleaned_type, answers, options, has_points_column)
+        if evaluation_mode == "question":
+            return "multichoiceset"
+        if evaluation_mode == "responses":
+            return "oumultiresponse"
+        # Fallback: privilégier multiréponses
+        return "oumultiresponse"
     if cleaned_type in {"textelebre", "textelibre", "essay", "ouverte"}:
         return "essay"
 
