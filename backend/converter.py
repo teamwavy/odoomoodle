@@ -187,6 +187,8 @@ def extract_questions(df: pd.DataFrame, options: Dict) -> List[ParsedQuestion]:
                     Answer(text="true", is_correct=tf_value is True),
                     Answer(text="false", is_correct=tf_value is False),
                 ]
+            elif cleaned_type in {"textelebre", "textelibre", "essay", "ouverte"}:
+                answers = []
             else:
                 # On ignore les entrées sans réponses réelles (lignes d'entête ou métadonnées).
                 continue
